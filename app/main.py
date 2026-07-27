@@ -7,7 +7,7 @@ import secrets
 import signal
 import time
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from telethon import TelegramClient, events, functions, utils
 from telethon.errors import FloodWaitError, RPCError, RandomIdDuplicateError
@@ -234,14 +234,14 @@ class Userbot:
         dialogs: list[tuple[int, str, str | None, str, str]] = []
         async for dialog in self.client.iter_dialogs():
             dialog_entity = dialog.entity
-            seen_at = dialog.date or datetime.now(UTC)
+            seen_at = dialog.date or datetime.now(timezone.utc)
             dialogs.append(
                 (
                     utils.get_peer_id(dialog_entity),
                     dialog.name or utils.get_display_name(dialog_entity),
                     getattr(dialog_entity, "username", None),
                     entity_chat_type(dialog_entity),
-                    seen_at.astimezone(UTC).isoformat(timespec="seconds"),
+                    seen_at.astimezone(timezone.utc).isoformat(timespec="seconds"),
                 )
             )
         await self.store.sync_dialogs(dialogs)
