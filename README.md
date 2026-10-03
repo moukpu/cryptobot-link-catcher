@@ -9,7 +9,7 @@
 Один чек проверяется независимо в каждом аккаунте, но выдача зависит от правил самого чека: одноразовый чек может получить только один аккаунт. Процессы не нажимают платёжные кнопки и не обходят условия подписки или пароль.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Telethon](https://img.shields.io/badge/Telethon-1.44-26A5E4?logo=telegram&logoColor=white)
+![Telethon](https://img.shields.io/badge/Telethon-1.45-26A5E4?logo=telegram&logoColor=white)
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04-E95420?logo=ubuntu&logoColor=white)
 [![Tests](https://github.com/moukpu/cryptobot-link-catcher/actions/workflows/tests.yml/badge.svg)](https://github.com/moukpu/cryptobot-link-catcher/actions/workflows/tests.yml)
 [![Release](https://img.shields.io/github/v/release/moukpu/cryptobot-link-catcher?display_name=tag)](https://github.com/moukpu/cryptobot-link-catcher/releases/latest)
