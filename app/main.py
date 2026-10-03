@@ -24,9 +24,11 @@ from app.control_bot import ControlBot
 from app.database import Claim, ProcessedStore
 from app.links import extract_start_parameters
 from app.logging_setup import configure_logging
+from app.receipts import is_receive_check, classify_bot_reply, source_html, LABELS
 
 
 logger = logging.getLogger("cryptobot_userbot")
+BOT_REPLY_TIMEOUT_SECONDS = 20
 
 
 def entity_has_active_username(entity: types.User, username: str) -> bool:
@@ -80,6 +82,9 @@ class Userbot:
         self.worker_task: asyncio.Task[None] | None = None
         self.queued_parameters: set[str] = set()
         self.lock_file = None
+        self.reply_lock = asyncio.Lock()
+        self.result_event = asyncio.Event()
+        self.active_parameter: str | None = None
 
     async def start(self) -> None:
         lock_path = self.settings.db_path.parent / "userbot.lock"
@@ -93,6 +98,7 @@ class Userbot:
             raise RuntimeError("Уже запущена другая копия процесса") from exc
         lock_path.chmod(0o600)
         await self.store.open()
+        await self.store.recover_attempts()
         for warning in enforce_private_permissions(self.settings):
             logger.warning(warning)
 
@@ -191,6 +197,8 @@ class Userbot:
             )
         await self.store.replace_system_ignored(system_ignored)
         await self._ensure_control_bot(me.id)
+        for row in await self.store.results_without_notice():
+            await self._notify_result(row)
         self.work_queue = asyncio.Queue(maxsize=1000)
         self.queued_parameters.clear()
         self.worker_task = asyncio.create_task(self._work_loop())
@@ -253,11 +261,7 @@ class Userbot:
             if self.stop_event.is_set():
                 return
             if event.chat_id == self.target_peer_id:
-                logger.debug(
-                    "Пропущено сообщение %s из чата @%s",
-                    event.id,
-                    TARGET_BOT_USERNAME,
-                )
+                await self._on_bot_message(event.message)
                 return
             control_bot_id = (
                 int(self.settings.control_bot_token.split(":", 1)[0])
@@ -268,6 +272,9 @@ class Userbot:
                 logger.debug("Пропущен системный чат панели управления")
                 return
 
+            chat = event.chat
+            title = utils.get_display_name(chat) if chat is not None else str(event.chat_id)
+            username = getattr(chat,'username',None) if chat is not None else None
             if event.chat_id is not None:
                 if await self.store.is_chat_ignored(event.chat_id):
                     logger.debug("Исключённый диалог пропущен")
@@ -309,9 +316,16 @@ class Userbot:
                     source_chat_id=event.chat_id,
                     source_message_id=event.id,
                     random_id=secrets.randbits(63),
+                    source_title=title,
+                    source_username=username,
+                    source_type=entity_chat_type(chat),
                 )
                 if await self.store.claim(claim):
-                    await self._enqueue_claim(claim)
+                    if is_receive_check(parameter):
+                        await self._enqueue_claim(claim)
+                    else:
+                        await self.store.finish_outcome(parameter,'blocked')
+                        await self.store.mark_failed(parameter,'Non-receive link blocked')
                 else:
                     logger.info("Повторный параметр пропущен")
         except asyncio.CancelledError:
@@ -338,34 +352,141 @@ class Userbot:
             claim = await queue.get()
             try:
                 await self._process_claim(claim)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception('Ошибка обработки результата; очередь продолжает работать')
+                row = await self.store.finish_outcome(claim.parameter,'unconfirmed',uncertain=True)
+                await self.store.mark_sent(claim.parameter)
+                await self._notify_result(row)
             finally:
                 self.queued_parameters.discard(claim.parameter)
                 queue.task_done()
 
     async def _process_claim(self, claim: Claim) -> None:
+        if not is_receive_check(claim.parameter):
+            await self.store.finish_outcome(claim.parameter,'blocked')
+            await self.store.mark_failed(claim.parameter,'Non-receive link blocked')
+            return
+        if (await self.store.detail(claim.parameter)).get('outcome') != 'queued':
+            return
+        while not await self.store.get_bool_setting('catcher_enabled',True):
+            await self._wait_or_stop(1)
+            if self.stop_event.is_set(): raise asyncio.CancelledError
+        self.result_event.clear()
+        self.active_parameter = claim.parameter
         try:
-            await self._start_target_bot(claim.parameter, claim.random_id)
+            async with self.reply_lock:
+                latest = await self.client.get_messages(self.target_bot,limit=1)
+                boundary = latest[0].id if latest else 0
+                await self.store.begin_attempt(claim.parameter,boundary)
+                result = await self._start_target_bot(claim.parameter, claim.random_id)
+                request_id = None
+                request_date = None
+                for update in getattr(result,'updates',[]) or []:
+                    message = getattr(update,'message',None)
+                    if (message is not None and getattr(message,'out',False)
+                        and getattr(message,'message',None) == '/start '+claim.parameter
+                        and getattr(getattr(message,'peer_id',None),'user_id',None) == self.target_peer_id):
+                        request_id = message.id
+                        request_date = message.date
+                    if isinstance(update,types.UpdateMessageID) and update.random_id == claim.random_id:
+                        request_id = update.id
+                if request_id is None:
+                    async for message in self.client.iter_messages(self.target_bot,limit=12,min_id=boundary):
+                        if message.out and message.raw_text == '/start '+claim.parameter:
+                            request_id = message.id
+                            request_date = message.date
+                            break
+                if request_id is not None:
+                    if request_date is None:
+                        outgoing = await self.client.get_messages(self.target_bot,ids=request_id)
+                        request_date = outgoing.date if outgoing else None
+                    await self.store.register_request(claim.parameter,request_id,
+                        request_date.astimezone(timezone.utc).isoformat(timespec='seconds') if request_date else None)
+                else:
+                    await self.store.finish_outcome(claim.parameter,'unconfirmed',uncertain=True)
+                await self.store.mark_sent(claim.parameter)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             await self.store.mark_failed(claim.parameter, repr(exc))
+            row = await self.store.finish_outcome(claim.parameter,'failed',uncertain=True)
             logger.exception("Запуск не выполнен")
-            if self.control_bot is not None:
-                await self.control_bot.notify("❌ Не удалось запустить @CryptoBot")
+            await self._notify_result(row)
+            self.active_parameter = None
             return
+        try:
+            # Read recent responses as well: an update may have arrived before registration.
+            async for message in self.client.iter_messages(self.target_bot,limit=15,min_id=boundary,reverse=True):
+                if not message.out: await self._on_bot_message(message)
+            if (await self.store.detail(claim.parameter)).get('outcome') == 'awaiting':
+                try:
+                    await asyncio.wait_for(self.result_event.wait(),timeout=BOT_REPLY_TIMEOUT_SECONDS)
+                except asyncio.TimeoutError:
+                    row = await self.store.finish_outcome(claim.parameter,'unconfirmed',uncertain=True)
+                    await self._notify_result(row)
+            elif request_id is None:
+                await self._notify_result(await self.store.detail(claim.parameter))
+        finally:
+            self.active_parameter = None
 
-        await self.store.mark_sent(claim.parameter)
-        logger.info("Успешно запущен только @%s", TARGET_BOT_USERNAME)
-        if self.control_bot is not None:
-            await self.control_bot.notify("✅ @CryptoBot успешно запущен")
+    async def _on_bot_message(self, message) -> None:
+        if getattr(message,'out',False):
+            async with self.reply_lock:
+                if self.active_parameter:
+                    row = await self.store.detail(self.active_parameter)
+                    if row.get('outcome') == 'awaiting' and message.id > (row.get('boundary_id') or 0) and message.id != row.get('request_message_id'):
+                        row = await self.store.finish_outcome(self.active_parameter,'unconfirmed',uncertain=True)
+                        self.result_event.set()
+                        await self._notify_result(row)
+            return
+        # Never parse forwarded messages as financial confirmations from the bot itself.
+        if getattr(message,'sender_id',None) != self.target_peer_id or getattr(message,'fwd_from',None): return
+        reply = classify_bot_reply(message.raw_text)
+        request_id = getattr(message,'reply_to_msg_id',None)
+        explicit = request_id is not None
+        if request_id is None:
+            async for previous in self.client.iter_messages(self.target_bot,limit=30,max_id=message.id):
+                if previous.out:
+                    request_id = previous.id
+                    break
+        async with self.reply_lock:
+            row = await self.store.record_bot_reply(message.id,reply,request_id,explicit=explicit,
+                received_at=message.date.astimezone(timezone.utc).isoformat(timespec='seconds'))
+            if row and row.get('parameter') == self.active_parameter:
+                self.result_event.set()
+            elif self.active_parameter and reply.kind != 'unknown':
+                active = await self.store.detail(self.active_parameter)
+                if active.get('outcome') == 'awaiting' and active.get('request_message_id') == request_id:
+                    unconfirmed = await self.store.finish_outcome(self.active_parameter,'unconfirmed',uncertain=True)
+                    self.result_event.set()
+                    if row is None: row = unconfirmed
+        if row: await self._notify_result(row)
 
-    async def _start_target_bot(self, parameter: str, random_id: int) -> None:
+    async def _notify_result(self, row: dict | None) -> None:
+        if not row or self.control_bot is None: return
+        if row['outcome'] == 'received':
+            text = f"✅ Получено {row['amount']} {row['asset']}"
+            if row.get('usd'): text += f" (≈ ${row['usd']} по ответу бота)"
+        else:
+            text = LABELS.get(row['outcome'],LABELS['unconfirmed'])
+        if row.get('parameter'):
+            text += '\n'+source_html(row)
+        else:
+            text += '\nИсточник не установлен. Возможно ручное получение или задержанный ответ.'
+        key = f"result:{row.get('parameter') or row.get('response_message_id')}:{row['outcome']}"
+        await self.control_bot.notify(text,key=key)
+
+    async def _start_target_bot(self, parameter: str, random_id: int):
+        if not is_receive_check(parameter):
+            raise ValueError('Запуск разрешён только для CQ-чеков на получение')
         if self.client is None or self.target_bot is None:
             raise RuntimeError("Telegram-клиент не готов")
 
         for attempt in range(1, self.settings.send_retries + 1):
             try:
-                await self.client(
+                result = await self.client(
                     functions.messages.StartBotRequest(
                         bot=self.target_bot,
                         peer=self.target_bot,
@@ -373,7 +494,7 @@ class Userbot:
                         start_param=parameter,
                     )
                 )
-                return
+                return result
             except RandomIdDuplicateError:
                 logger.warning("Telegram подтвердил повтор уже принятого запроса")
                 return
