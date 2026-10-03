@@ -33,3 +33,10 @@ def test_control_token_format_is_validated(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("CONTROL_BOT_TOKEN", "not-a-token")
     with pytest.raises(ValueError, match="CONTROL_BOT_TOKEN"):
         load_settings()
+
+
+def test_two_accounts_cannot_share_database(monkeypatch, tmp_path) -> None:
+    configure_minimum(monkeypatch, tmp_path)
+    monkeypatch.setenv("SECONDARY_DB_PATH", str(tmp_path / "data" / "db.sqlite3"))
+    with pytest.raises(ValueError, match="разные базы"):
+        load_settings()

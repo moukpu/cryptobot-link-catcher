@@ -1,5 +1,13 @@
 # CryptoBot Link Catcher
 
+## Два аккаунта
+
+Каждому аккаунту нужны отдельная авторизованная сессия, база и процесс. Во втором конфигурационном файле `.env.second` задайте `SESSION_PATH=session/telegram_second`, `DB_PATH=data_second/processed.sqlite3`, `LOG_FILE=data_second/userbot.log` и оставьте `CONTROL_BOT_TOKEN` и `SECONDARY_DB_PATH` пустыми. Запускайте второй процесс с `CRYPTOBOT_ENV_PATH=/opt/cryptobot-userbot/.env.second`; шаблон службы находится в `deploy/cryptobot-userbot-second.service`.
+
+В основном `.env` задайте `SECONDARY_DB_PATH=data_second/processed.sqlite3`. Только основной процесс подключает панель: она доставляет уведомления двух аккаунтов владельцу первого, показывает отдельную статистику и переключение аккаунта в истории. Пауза и продолжение действуют на оба процесса; исключения из основного списка чатов относятся к первому аккаунту. Исключения второго храните в его отдельной базе.
+
+Один чек проверяется независимо в каждом аккаунте, но выдача зависит от правил самого чека: одноразовый чек может получить только один аккаунт. Процессы не нажимают платёжные кнопки и не обходят условия подписки или пароль.
+
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Telethon](https://img.shields.io/badge/Telethon-1.44-26A5E4?logo=telegram&logoColor=white)
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04-E95420?logo=ubuntu&logoColor=white)

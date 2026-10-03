@@ -70,6 +70,7 @@ class Userbot:
     def __init__(self) -> None:
         self.settings = load_settings()
         self.store = ProcessedStore(self.settings.db_path)
+        self.secondary_store: ProcessedStore | None = None
         self.stop_event = asyncio.Event()
         self.client: TelegramClient | None = None
         self.target_bot: types.User | None = None
@@ -138,6 +139,8 @@ class Userbot:
                     with suppress(asyncio.CancelledError):
                         await self.control_task
             await self.store.close()
+            if self.secondary_store is not None:
+                await self.secondary_store.close()
             if self.lock_file is not None:
                 self.lock_file.close()
                 self.lock_file = None
@@ -233,7 +236,13 @@ class Userbot:
         if not self.settings.control_bot_token or self.control_task is not None:
             return
         admin_id = self.settings.control_admin_id or account_id
-        self.control_bot = ControlBot(self.settings, self.store, admin_id)
+        if self.settings.secondary_db_path is not None:
+            if self.settings.secondary_db_path == self.settings.db_path:
+                raise ValueError("Аккаунты должны использовать разные базы данных")
+            self.settings.secondary_db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.secondary_store = ProcessedStore(self.settings.secondary_db_path)
+            await self.secondary_store.open()
+        self.control_bot = ControlBot(self.settings, self.store, admin_id, self.secondary_store)
         self.control_task = asyncio.create_task(self.control_bot.run())
 
     async def _sync_dialogs(self) -> None:
