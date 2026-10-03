@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 from contextlib import suppress
 
 from telethon import Button, TelegramClient, events, functions
-from telethon.errors import MessageNotModifiedError, RandomIdDuplicateError
+from telethon.errors import MessageNotModifiedError, RandomIdDuplicateError, FloodWaitError
 from telethon.extensions import html as telegram_html
 
 from app import __version__
@@ -489,6 +489,9 @@ class ControlBot:
                             pass
                         await self.store.notice_sent(key)
             except asyncio.CancelledError: raise
+            except FloodWaitError as exc:
+                logger.warning('Telegram отложил доставку уведомления на %s сек.',exc.seconds)
+                await self._wait_or_stop(int(exc.seconds)+1)
             except Exception:
                 logger.warning('Доставка уведомления отложена')
                 await self._wait_or_stop(10)
