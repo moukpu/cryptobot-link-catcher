@@ -4,8 +4,11 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from decimal import Decimal, localcontext
+import secrets
 
 import aiosqlite
+from app.receipts import BotReply, source_links
 
 
 def _now() -> str:
@@ -18,6 +21,9 @@ class Claim:
     source_chat_id: int | None
     source_message_id: int | None
     random_id: int
+    source_title: str | None = None
+    source_username: str | None = None
+    source_type: str = 'unknown'
 
 
 class ProcessedStore:
@@ -26,6 +32,7 @@ class ProcessedStore:
         self._db: aiosqlite.Connection | None = None
         self._toggle_lock = asyncio.Lock()
         self._settings_lock = asyncio.Lock()
+        self._results_lock = asyncio.Lock()
 
     async def open(self) -> None:
         self._db = await aiosqlite.connect(self.path)
@@ -128,7 +135,37 @@ class ProcessedStore:
             (_now(),),
         )
         await self._db.commit()
-        await self._db.execute("PRAGMA user_version=2")
+        await self._db.executescript('''
+            CREATE TABLE IF NOT EXISTS claim_details (
+                parameter TEXT PRIMARY KEY,
+                source_title TEXT, source_username TEXT, source_type TEXT,
+                chat_url TEXT, message_url TEXT,
+                outcome TEXT NOT NULL DEFAULT 'queued',
+                request_message_id INTEGER, boundary_id INTEGER, requested_at TEXT,
+                response_message_id INTEGER, amount TEXT, asset TEXT, usd TEXT,
+                correlation TEXT, updated_at TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS claim_request_id
+                ON claim_details(request_message_id) WHERE request_message_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS bot_receipts (
+                message_id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
+                amount TEXT, asset TEXT, usd TEXT, parameter TEXT,
+                received_at TEXT NOT NULL, correlation TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS receipt_per_check
+                ON bot_receipts(parameter) WHERE kind='received' AND parameter IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS notification_outbox (
+                event_key TEXT PRIMARY KEY, body TEXT NOT NULL, random_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL, sent_at TEXT
+            );
+            INSERT OR IGNORE INTO claim_details(parameter,outcome,updated_at)
+                SELECT parameter,CASE WHEN status='processing' THEN 'queued'
+                WHEN status='failed' THEN 'legacy_failed' ELSE 'legacy' END,
+                COALESCE(finished_at,claimed_at) FROM processed_starts;
+        ''')
+        # Preserve deduplication and old transport statuses; never call legacy sends income.
+        await self._db.execute("PRAGMA user_version=3")
+        await self._db.commit()
 
     async def close(self) -> None:
         if self._db is not None:
@@ -158,6 +195,13 @@ class ProcessedStore:
             ),
         )
         await db.commit()
+        if cursor.rowcount == 1:
+            chat_url, message_url = source_links(claim.source_chat_id, claim.source_message_id, claim.source_username, claim.source_type)
+            await db.execute('''INSERT OR IGNORE INTO claim_details
+                (parameter,source_title,source_username,source_type,chat_url,message_url,outcome,updated_at)
+                VALUES (?,?,?,?,?,?,'queued',?)''',
+                (claim.parameter,claim.source_title,claim.source_username,claim.source_type,chat_url,message_url,_now()))
+            await db.commit()
         return cursor.rowcount == 1
 
     async def pending_claims(self) -> list[Claim]:
@@ -543,3 +587,153 @@ class ProcessedStore:
             for chat_id, title, username, chat_type, ignored, locked
             in await cursor.fetchall()
         ]
+
+    async def detail(self, parameter: str) -> dict:
+        db = self._connection()
+        cursor = await db.execute('''SELECT d.*,p.source_chat_id,p.source_message_id,p.claimed_at,
+            COALESCE(d.source_title,c.title) AS display_title,
+            COALESCE(d.source_username,c.username) AS display_username,
+            COALESCE(NULLIF(d.source_type,'unknown'),c.chat_type,'unknown') AS display_type
+            FROM claim_details d JOIN processed_starts p USING(parameter)
+            LEFT JOIN observed_chats c ON c.chat_id=p.source_chat_id WHERE d.parameter=?''', (parameter,))
+        row = await cursor.fetchone()
+        result = dict(zip((column[0] for column in cursor.description),row)) if row else {}
+        if result:
+            result['source_title'] = result['display_title']
+            if not result['chat_url']:
+                result['chat_url'],result['message_url'] = source_links(result['source_chat_id'],result['source_message_id'],result['display_username'],result['display_type'])
+        return result
+
+    async def begin_attempt(self, parameter: str, boundary_id: int) -> None:
+        await self._connection().execute('''UPDATE claim_details SET outcome='awaiting',
+            boundary_id=?,requested_at=?,updated_at=? WHERE parameter=? AND outcome='queued' ''',
+            (boundary_id,_now(),_now(),parameter))
+        await self._connection().commit()
+
+    async def register_request(self, parameter: str, message_id: int, requested_at: str | None = None) -> None:
+        await self._connection().execute('UPDATE claim_details SET request_message_id=?,requested_at=? WHERE parameter=?', (message_id,requested_at or _now(),parameter))
+        await self._connection().commit()
+
+    async def finish_outcome(self, parameter: str, outcome: str, *, uncertain: bool = False) -> dict:
+        async with self._results_lock:
+            db = self._connection()
+            cursor = await db.execute('''UPDATE claim_details SET outcome=?,updated_at=?
+                WHERE parameter=? AND outcome IN ('queued','awaiting')''', (outcome,_now(),parameter))
+            await db.commit()
+            if uncertain and cursor.rowcount:
+                await self.set_bool_setting('correlation_safe',False)
+            return await self.detail(parameter) if cursor.rowcount else {}
+
+    async def recover_attempts(self) -> int:
+        db = self._connection()
+        cursor = await db.execute("SELECT COUNT(*) FROM claim_details WHERE outcome='awaiting'")
+        count = (await cursor.fetchone())[0]
+        if count:
+            await db.execute("UPDATE processed_starts SET status='sent',finished_at=? WHERE parameter IN (SELECT parameter FROM claim_details WHERE outcome='awaiting') AND status='processing'", (_now(),))
+            await db.execute("UPDATE claim_details SET outcome='unconfirmed',updated_at=? WHERE outcome='awaiting'", (_now(),))
+            await db.commit()
+            await self.set_bool_setting('correlation_safe',False)
+        return count
+
+    async def record_bot_reply(self, message_id: int, reply: BotReply, request_id: int | None,
+                               *, explicit: bool = False, received_at: str | None = None) -> dict | None:
+        """Immutable receipt IDs and one payment per check prevent replay/edited-message income."""
+        async with self._results_lock:
+            db = self._connection()
+            cursor = await db.execute('SELECT kind FROM bot_receipts WHERE message_id=?', (message_id,))
+            existing = await cursor.fetchone()
+            if existing and existing[0] in ('received','duplicate'): return None
+            parameter, correlation = None, None
+            candidate = None
+            if request_id:
+                cursor = await db.execute('SELECT parameter FROM claim_details WHERE request_message_id=?', (request_id,))
+                row = await cursor.fetchone()
+                if row: candidate = await self.detail(row[0])
+            timestamp = received_at or _now()
+            if candidate:
+                within_attempt = candidate['requested_at'] and 0 <= (datetime.fromisoformat(timestamp)-datetime.fromisoformat(candidate['requested_at'])).total_seconds() <= 20
+                safe = explicit or (within_attempt and await self.get_bool_setting('correlation_safe',True))
+                if safe and message_id > (candidate['boundary_id'] or 0) and candidate['outcome'] == 'awaiting' and reply.kind != 'unknown':
+                    parameter = candidate['parameter']
+                    correlation = 'reply' if explicit else 'sequence'
+                elif candidate['outcome'] == 'received' and reply.kind == 'received':
+                    reply = BotReply('duplicate')
+            await db.execute('''INSERT INTO bot_receipts(message_id,kind,amount,asset,usd,parameter,received_at,correlation)
+                VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET
+                kind=excluded.kind,amount=excluded.amount,asset=excluded.asset,usd=excluded.usd,
+                parameter=excluded.parameter,correlation=excluded.correlation''',
+                (message_id,reply.kind,reply.amount,reply.asset,reply.usd,parameter,timestamp,correlation))
+            if parameter:
+                await db.execute('''UPDATE claim_details SET outcome=?,response_message_id=?,
+                    amount=?,asset=?,usd=?,correlation=?,updated_at=? WHERE parameter=?''',
+                    (reply.kind,message_id,reply.amount,reply.asset,reply.usd,correlation,_now(),parameter))
+            await db.commit()
+            if parameter: return await self.detail(parameter)
+            if reply.kind == 'received':
+                return {'outcome':'received','amount':reply.amount,'asset':reply.asset,'usd':reply.usd,'parameter':None,'response_message_id':message_id}
+            return None
+
+    async def history_page(self, page: int = 0, size: int = 5) -> tuple[list[dict], int]:
+        db = self._connection()
+        cursor = await db.execute('SELECT COUNT(*) FROM claim_details')
+        count = (await cursor.fetchone())[0]
+        cursor = await db.execute('''SELECT d.*,p.source_chat_id,p.source_message_id,p.claimed_at,
+            COALESCE(d.source_title,c.title) AS display_title,
+            COALESCE(d.source_username,c.username) AS display_username,
+            COALESCE(NULLIF(d.source_type,'unknown'),c.chat_type,'unknown') AS display_type
+            FROM claim_details d JOIN processed_starts p USING(parameter)
+            LEFT JOIN observed_chats c ON c.chat_id=p.source_chat_id
+            ORDER BY p.claimed_at DESC,p.parameter LIMIT ? OFFSET ?''',(size,max(page,0)*size))
+        columns = [column[0] for column in cursor.description]
+        rows = [dict(zip(columns,row)) for row in await cursor.fetchall()]
+        for row in rows:
+            row['source_title'] = row['display_title']
+            if not row['chat_url']:
+                row['chat_url'],row['message_url'] = source_links(row['source_chat_id'],row['source_message_id'],row['display_username'],row['display_type'])
+        return rows,count
+
+    async def income(self, since: str | None = None) -> dict:
+        cursor = await self._connection().execute('''SELECT amount,asset,parameter FROM bot_receipts
+            WHERE kind='received' AND (? IS NULL OR received_at>=?)''',(since,since))
+        totals: dict[str, Decimal] = {}
+        unmatched: dict[str, Decimal] = {}
+        count, other_count = 0,0
+        with localcontext() as context:
+            context.prec = 100
+            for amount,asset,parameter in await cursor.fetchall():
+                target = totals if parameter else unmatched
+                target[asset] = target.get(asset,Decimal(0))+Decimal(amount)
+                if parameter: count += 1
+                else: other_count += 1
+        return {'count':count,'totals':{k:format(v,'f') for k,v in sorted(totals.items())},
+                'unmatched_count':other_count,'unmatched':{k:format(v,'f') for k,v in sorted(unmatched.items())}}
+
+    async def outcome_counts(self) -> dict[str,int]:
+        cursor = await self._connection().execute('SELECT outcome,COUNT(*) FROM claim_details GROUP BY outcome')
+        return {row[0]:row[1] for row in await cursor.fetchall()}
+
+    async def queue_notice(self, key: str, body: str) -> None:
+        await self._connection().execute('INSERT OR IGNORE INTO notification_outbox(event_key,body,random_id,created_at) VALUES (?,?,?,?)',
+                                        (key,body,secrets.randbits(63),_now()))
+        await self._connection().commit()
+
+    async def pending_notices(self) -> list[tuple[str,str,int]]:
+        cursor = await self._connection().execute('SELECT event_key,body,random_id FROM notification_outbox WHERE sent_at IS NULL ORDER BY created_at,event_key LIMIT 20')
+        return await cursor.fetchall()
+
+    async def results_without_notice(self) -> list[dict]:
+        cursor = await self._connection().execute('''SELECT d.parameter FROM claim_details d
+            WHERE d.outcome NOT IN ('queued','awaiting','legacy','legacy_failed','blocked')
+            AND NOT EXISTS (SELECT 1 FROM notification_outbox n WHERE n.event_key='result:'||d.parameter||':'||d.outcome)
+            ORDER BY d.updated_at LIMIT 100''')
+        rows = [await self.detail(row[0]) for row in await cursor.fetchall()]
+        cursor = await self._connection().execute('''SELECT message_id,amount,asset,usd FROM bot_receipts r
+            WHERE r.kind='received' AND r.parameter IS NULL
+            AND NOT EXISTS (SELECT 1 FROM notification_outbox n WHERE n.event_key='result:'||r.message_id||':received')
+            ORDER BY received_at LIMIT 100''')
+        rows.extend({'parameter':None,'outcome':'received','response_message_id':row[0],'amount':row[1],'asset':row[2],'usd':row[3]} for row in await cursor.fetchall())
+        return rows
+
+    async def notice_sent(self, key: str) -> None:
+        await self._connection().execute('UPDATE notification_outbox SET sent_at=? WHERE event_key=?',(_now(),key))
+        await self._connection().commit()

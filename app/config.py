@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-ENV_PATH = PROJECT_ROOT / ".env"
+ENV_PATH = Path(os.getenv("CRYPTOBOT_ENV_PATH") or PROJECT_ROOT / ".env").expanduser().resolve()
 TARGET_BOT_USERNAME = "CryptoBot"
 TARGET_BOT_ID = 1559501630
 
@@ -54,6 +54,7 @@ class Settings:
     control_bot_token: str | None
     control_admin_id: int | None
     control_session_path: Path
+    secondary_db_path: Path | None = None
 
 
 def load_settings(*, require_phone: bool = False) -> Settings:
@@ -104,7 +105,11 @@ def load_settings(*, require_phone: bool = False) -> Settings:
             "CONTROL_SESSION_PATH",
             "session/control_bot",
         ),
+        secondary_db_path=_project_path("SECONDARY_DB_PATH", "data_second/processed.sqlite3")
+        if os.getenv("SECONDARY_DB_PATH", "").strip() else None,
     )
+    if settings.secondary_db_path == settings.db_path:
+        raise ValueError("Аккаунты должны использовать разные базы данных")
     settings.session_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     settings.control_session_path.parent.mkdir(
         parents=True,

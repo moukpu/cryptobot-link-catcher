@@ -40,7 +40,7 @@ def test_network_retry_reuses_same_random_id() -> None:
     async def scenario() -> None:
         client = Client()
         userbot = make_userbot(client)
-        await userbot._start_target_bot("PAYLOAD", 123456)
+        await userbot._start_target_bot("CQ_PAYLOAD", 123456)
         assert client.random_ids == [123456, 123456]
 
     asyncio.run(scenario())
@@ -51,7 +51,7 @@ def test_duplicate_random_id_is_treated_as_success() -> None:
         async def __call__(self, _request):
             raise RandomIdDuplicateError(request=None)
 
-    asyncio.run(make_userbot(Client())._start_target_bot("PAYLOAD", 321))
+    asyncio.run(make_userbot(Client())._start_target_bot("CQ_PAYLOAD", 321))
 
 
 def test_flood_wait_above_limit_fails_without_sleeping() -> None:
@@ -60,4 +60,4 @@ def test_flood_wait_above_limit_fails_without_sleeping() -> None:
             raise FloodWaitError(request=None, capture=20)
 
     with pytest.raises(RuntimeError, match="превышает"):
-        asyncio.run(make_userbot(Client())._start_target_bot("PAYLOAD", 321))
+        asyncio.run(make_userbot(Client())._start_target_bot("CQ_PAYLOAD", 321))

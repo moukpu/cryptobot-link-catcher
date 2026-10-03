@@ -1,5 +1,5 @@
 [Unit]
-Description=Telegram CryptoBot start-link userbot
+Description=Telegram CryptoBot checker second account
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -10,7 +10,8 @@ Type=simple
 User=telegram-userbot
 Group=telegram-userbot
 WorkingDirectory=/opt/cryptobot-userbot
-EnvironmentFile=/opt/cryptobot-userbot/.env
+EnvironmentFile=/opt/cryptobot-userbot/.env.second
+Environment=CRYPTOBOT_ENV_PATH=/opt/cryptobot-userbot/.env.second
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/cryptobot-userbot/.venv/bin/python -m app.main
@@ -18,7 +19,6 @@ Restart=always
 RestartSec=5
 TimeoutStopSec=30
 UMask=0077
-
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
@@ -32,7 +32,7 @@ ProtectControlGroups=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 AmbientCapabilities=
-ReadWritePaths=/opt/cryptobot-userbot/session /opt/cryptobot-userbot/data -/opt/cryptobot-userbot/data_second
+ReadWritePaths=/opt/cryptobot-userbot/session /opt/cryptobot-userbot/data_second
 RestrictSUIDSGID=true
 LockPersonality=true
 TasksMax=64

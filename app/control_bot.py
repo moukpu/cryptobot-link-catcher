@@ -3,14 +3,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import html
+from datetime import datetime, timezone, timedelta
 from contextlib import suppress
 
-from telethon import Button, TelegramClient, events
-from telethon.errors import MessageNotModifiedError
+from telethon import Button, TelegramClient, events, functions
+from telethon.errors import MessageNotModifiedError, RandomIdDuplicateError, FloodWaitError
+from telethon.extensions import html as telegram_html
 
 from app import __version__
 from app.config import Settings
 from app.database import ProcessedStore
+from app.receipts import LABELS, source_html
 
 
 logger = logging.getLogger("control_bot")
@@ -22,16 +26,26 @@ class ControlBot:
         settings: Settings,
         store: ProcessedStore,
         admin_id: int,
+        secondary_store: ProcessedStore | None = None,
     ) -> None:
         if not settings.control_bot_token:
             raise ValueError("Панель управления не настроена")
         self.settings = settings
         self.store = store
+        self.secondary_store = secondary_store
         self.admin_id = admin_id
         self.token = settings.control_bot_token
         self.bot_id = int(self.token.split(":", 1)[0])
         self.client: TelegramClient | None = None
         self.stop_event = asyncio.Event()
+
+    def _stores(self) -> list[tuple[str, ProcessedStore]]:
+        secondary = getattr(self, "secondary_store", None)
+        return [("Аккаунт 1", self.store), ("Аккаунт 2", secondary)] if secondary is not None else [("", self.store)]
+
+    async def _set_enabled(self, enabled: bool) -> None:
+        for _, store in self._stores():
+            await store.set_bool_setting("catcher_enabled", enabled)
 
     async def run(self) -> None:
         delay = 3
@@ -75,7 +89,12 @@ class ControlBot:
         if me.id != self.bot_id or not me.bot:
             raise RuntimeError("Сессия панели принадлежит другому Telegram-боту")
         logger.info("Панель управления запущена")
-        await self.client.run_until_disconnected()
+        notifier = asyncio.create_task(self._notice_loop())
+        try:
+            await self.client.run_until_disconnected()
+        finally:
+            notifier.cancel()
+            with suppress(asyncio.CancelledError): await notifier
         if not self.stop_event.is_set():
             raise ConnectionError("Клиент панели управления отключился")
 
@@ -192,13 +211,13 @@ class ControlBot:
             await event.respond(await self.status_text(), buttons=self._menu())
         elif command == "/stats":
             await event.respond(await self.stats_text(), buttons=self._menu())
-        elif command == "/recent":
-            await event.respond(await self.recent_text(), buttons=self._menu())
+        elif command in {"/recent", "/history"}:
+            await self._send_history_page(event,0,edit=False)
         elif command == "/pause":
-            await self.store.set_bool_setting("catcher_enabled", False)
+            await self._set_enabled(False)
             await event.respond("⏸ Ловец поставлен на паузу.", buttons=self._menu())
         elif command == "/resume":
-            await self.store.set_bool_setting("catcher_enabled", True)
+            await self._set_enabled(True)
             await event.respond("▶️ Ловец снова активен.", buttons=self._menu())
         elif command in {"/ignored", "/chats"}:
             view = "ignored" if command == "/ignored" else "all"
@@ -251,17 +270,35 @@ class ControlBot:
     async def _handle_callback(self, event: events.CallbackQuery.Event) -> None:
         action = event.data.decode("utf-8", errors="ignore")
         if action == "pause":
-            await self.store.set_bool_setting("catcher_enabled", False)
+            await self._set_enabled(False)
             text = "⏸ Ловец поставлен на паузу."
         elif action == "resume":
-            await self.store.set_bool_setting("catcher_enabled", True)
+            await self._set_enabled(True)
             text = "▶️ Ловец снова активен."
         elif action == "status":
             text = await self.status_text()
         elif action == "stats":
             text = await self.stats_text()
-        elif action == "recent":
-            text = await self.recent_text()
+        elif action == "recent" or action.startswith('history:'):
+            try: page = int(action.split(':')[1]) if ':' in action else 0
+            except ValueError: page = 0
+            await event.answer()
+            await self._send_history_page(event,page,edit=True)
+            return
+        elif action.startswith('history2:'):
+            try: page = int(action.split(':')[1])
+            except ValueError: page = 0
+            await event.answer()
+            await self._send_history_page(event,page,edit=True,second=True)
+            return
+        elif action in {'unmatched','unmatched2'}:
+            second = action == 'unmatched2'
+            if second and getattr(self, 'secondary_store', None) is None:
+                await event.answer('Второй аккаунт не подключён',alert=True)
+                return
+            await event.answer()
+            await event.edit(await self.unmatched_text(second=second),buttons=[[Button.inline('↩️ История',b'history2:0' if second else b'recent')]])
+            return
         elif action == "notifications":
             enabled = await self.store.toggle_bool_setting(
                 "notifications_enabled",
@@ -326,36 +363,95 @@ class ControlBot:
             worker_status = "🟢 активен"
         else:
             worker_status = "🟠 переподключается"
-        return (
+        correlation = await self.store.get_bool_setting('correlation_safe',True)
+        text = (
             f"Ловец: {worker_status}\n"
             f"Уведомления: {'🔔 включены' if notifications else '🔕 выключены'}\n"
             f"Получатель: только @CryptoBot\nВерсия: {__version__}"
+            + ('\nЕсть неоднозначные ответы: поступления без надёжной связи учитываются отдельно.' if not correlation else '')
         )
+        if getattr(self, 'secondary_store', None) is not None:
+            second_enabled = await self.secondary_store.get_bool_setting('catcher_enabled',True)
+            second_connected = await self.secondary_store.get_bool_setting('worker_connected',False)
+            state = '⏸ на паузе' if not second_enabled else '🟢 активен' if second_connected else '🟠 не подключён'
+            text = 'Аккаунт 1\n' + text + '\n\nАккаунт 2: ' + state
+        return text
 
     async def stats_text(self) -> str:
-        stats = await self.store.statistics()
-        total = sum(stats.values())
-        return (
-            f"Всего уникальных параметров: {total}\n"
-            f"✅ Успешно: {stats['sent']}\n"
-            f"❌ Ошибки: {stats['failed']}\n"
-            f"⏳ В обработке: {stats['processing']}"
-        )
+        sections = []
+        for label,store in self._stores():
+            sections.append((label+'\n' if label else '') + await self._stats_for_store(store))
+        return '\n\n'.join(sections)
+
+    async def _stats_for_store(self, store: ProcessedStore) -> str:
+        now = datetime.now(timezone(timedelta(hours=5)))
+        midnight = now.replace(hour=0,minute=0,second=0,microsecond=0)
+        lines = ['Подтверждённые получения чекера']
+        for label,since in [('Сегодня',midnight),('Последние 7 дней',midnight-timedelta(days=6)),('Всё время',None)]:
+            income = await store.income(since.astimezone(timezone.utc).isoformat(timespec='seconds') if since else None)
+            amounts = ', '.join(f'{amount} {asset}' for asset,amount in income['totals'].items()) or '0'
+            lines.append(f'{label}: {income["count"]} чеков · {amounts}')
+        income = await store.income()
+        if income['unmatched_count']:
+            amounts = ', '.join(f'{amount} {asset}' for asset,amount in income['unmatched'].items())
+            lines += ['',f'Отдельно, источник не установлен: {income["unmatched_count"]} поступлений · {amounts}', 'Это могут быть ручные получения или задержанные ответы.']
+        counts = await store.outcome_counts()
+        lines += ['',f'Обязательная подписка: {counts.get("subscription",0)}',f'Пароль: {counts.get("password",0)} · Капча: {counts.get("captcha",0)}',f'Заблокированные ссылки/счета: {counts.get("blocked",0)+counts.get("payment",0)}',f'Без подтверждения: {counts.get("legacy",0)+counts.get("unconfirmed",0)}',f'В очереди/ожидании: {counts.get("queued",0)+counts.get("awaiting",0)}','Дни считаются по UTC+5. Учёт поступлений — с версии 1.1.0.']
+        return '\n'.join(lines)
 
     async def recent_text(self) -> str:
-        rows = await self.store.recent(10)
+        rows,_ = await self.store.history_page(0)
         if not rows:
             return "История пока пуста."
-        icons = {"sent": "✅", "failed": "❌", "processing": "⏳"}
-        lines = ["Последние срабатывания:"]
-        for parameter, status, timestamp in rows:
-            masked = (
-                parameter
-                if len(parameter) <= 8
-                else f"{parameter[:4]}…{parameter[-4:]}"
-            )
-            lines.append(f"{icons.get(status, '•')} {masked} — {timestamp}")
-        return "\n".join(lines)
+        return self._history_text(rows)
+
+    @staticmethod
+    def _history_text(rows: list[dict]) -> str:
+        lines = ['История чеков']
+        for row in rows:
+            label = LABELS.get(row['outcome'],LABELS['unconfirmed'])
+            if row['outcome'] == 'received': label += f" {row['amount']} {row['asset']}"
+            timestamp = datetime.fromisoformat(row['claimed_at']).astimezone(timezone(timedelta(hours=5))).strftime('%d.%m %H:%M')
+            lines += ['',f'{html.escape(label)} · {timestamp}',source_html(row)]
+        return '\n'.join(lines)
+
+    async def _send_history_page(self,event,page: int,*,edit: bool,second: bool=False) -> None:
+        secondary = getattr(self, 'secondary_store', None)
+        if second and secondary is None:
+            await event.answer('Второй аккаунт не подключён',alert=True)
+            return
+        store = secondary if second else self.store
+        prefix = 'history2' if second else 'history'
+        rows,count = await store.history_page(max(0,page))
+        pages = max(1,(count+4)//5)
+        page = max(0,min(page,pages-1))
+        if not rows and count: rows,_ = await store.history_page(page)
+        text = self._history_text(rows) if rows else 'История пока пуста.'
+        if secondary is not None: text = ('Аккаунт 2\n' if second else 'Аккаунт 1\n') + text
+        navigation = []
+        if page: navigation.append(Button.inline('⬅️',f'{prefix}:{page-1}'.encode()))
+        navigation.append(Button.inline(f'{page+1}/{pages}',f'{prefix}:{page}'.encode()))
+        if page+1<pages: navigation.append(Button.inline('➡️',f'{prefix}:{page+1}'.encode()))
+        buttons = [navigation,[Button.inline('💰 Без установленного источника',b'unmatched2' if second else b'unmatched')]]
+        if secondary is not None: buttons.append([Button.inline('Аккаунт 1',b'history:0'),Button.inline('Аккаунт 2',b'history2:0')])
+        buttons.append([Button.inline('↩️ Главное меню',b'status')])
+        if edit:
+            with suppress(MessageNotModifiedError): await event.edit(text,buttons=buttons,parse_mode='html',link_preview=False)
+        else:
+            await event.respond(text,buttons=buttons,parse_mode='html',link_preview=False)
+
+    async def unmatched_text(self,second: bool=False) -> str:
+        store = self.secondary_store if second else self.store
+        cursor = await store._connection().execute("SELECT amount,asset,received_at,message_id FROM bot_receipts WHERE kind='received' AND parameter IS NULL ORDER BY received_at DESC LIMIT 15")
+        rows = await cursor.fetchall()
+        lines = ['Поступления без установленного источника','Не включены в доход чекера с известным источником.']
+        if getattr(self, 'secondary_store', None) is not None:
+            lines.insert(0,'Аккаунт 2' if second else 'Аккаунт 1')
+        for amount,asset,timestamp,message_id in rows:
+            date = datetime.fromisoformat(timestamp).astimezone(timezone(timedelta(hours=5))).strftime('%d.%m %H:%M')
+            lines.append(f'{date}: {amount} {asset} · сообщение CryptoBot #{message_id}')
+        if not rows: lines.append('Пока нет.')
+        return '\n'.join(lines)
 
     async def ignored_text(self) -> str:
         ignored = await self.store.ignored_chats()
@@ -419,15 +515,32 @@ class ControlBot:
         else:
             await event.respond(text, buttons=buttons)
 
-    async def notify(self, text: str) -> None:
+    async def notify(self, text: str, *, key: str) -> None:
         if not await self.store.get_bool_setting("notifications_enabled", True):
             return
-        if self.client is None or not self.client.is_connected():
-            return
-        try:
-            await self.client.send_message(self.admin_id, text)
-        except Exception:
-            logger.exception("Не удалось отправить уведомление владельцу")
+        await self.store.queue_notice(key,text)
+
+    async def _notice_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                if await self.store.get_bool_setting('notifications_enabled',True):
+                    for label,store in self._stores():
+                        for key,body,random_id in await store.pending_notices():
+                            text,entities = telegram_html.parse((label+'\n' if label else '')+body)
+                            peer = await self.client.get_input_entity(self.admin_id)
+                            try:
+                                await self.client(functions.messages.SendMessageRequest(peer=peer,message=text,entities=entities,random_id=random_id,no_webpage=True))
+                            except RandomIdDuplicateError:
+                                pass
+                            await store.notice_sent(key)
+            except asyncio.CancelledError: raise
+            except FloodWaitError as exc:
+                logger.warning('Telegram отложил доставку уведомления на %s сек.',exc.seconds)
+                await self._wait_or_stop(int(exc.seconds)+1)
+            except Exception:
+                logger.warning('Доставка уведомления отложена')
+                await self._wait_or_stop(10)
+            await self._wait_or_stop(1)
 
     async def _wait_or_stop(self, seconds: int) -> None:
         try:
